@@ -1,0 +1,10 @@
+[project]
+name = "pkcs11-gui"
+version = "0.1.0"
+description = "A GUI for PKCS11 tokens"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "pyside6>=6.10.1",
+    "python-pkcs11>=0.9.3",
+]
