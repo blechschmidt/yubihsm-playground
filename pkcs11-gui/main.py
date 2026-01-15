@@ -15,7 +15,8 @@ from PySide6.QtWidgets import (
 
 # PKCS#11
 from pkcs11 import lib as pkcs11_lib
-from pkcs11 import Mechanism, Attribute, ObjectClass, KeyType
+from pkcs11 import Mechanism, Attribute, ObjectClass, KeyType, Object
+from pkcs11.exceptions import AttributeTypeInvalid, AttributeSensitive
 
 @dataclass
 class SlotInfo:
@@ -105,7 +106,7 @@ class MainWindow(QMainWindow):
         self.current_slot_id: Optional[int] = None
         self.current_session = None  # pkcs11.Session
 
-        self.listed_objects = []
+        self.listed_objects: List[Object] = []
 
         self._build_ui()
         self._set_connected(False)
@@ -185,6 +186,9 @@ class MainWindow(QMainWindow):
         self.create_object_btn = QPushButton("Create object")
         self.create_object_btn.clicked.connect(self.on_create_object)
 
+        self.delete_object_btn = QPushButton("Delete object")
+        self.delete_object_btn.clicked.connect(self.on_delete_object)
+
         self.view_attrs_btn = QPushButton("View attributes")
         self.view_attrs_btn.clicked.connect(self.on_view_attributes)
 
@@ -202,6 +206,7 @@ class MainWindow(QMainWindow):
         obj_toolbar.addWidget(self.list_objects_btn)
         obj_toolbar.addWidget(self.create_object_btn)
         obj_toolbar.addWidget(self.view_attrs_btn)
+        obj_toolbar.addWidget(self.delete_object_btn)
 
         self.obj_table = QTableWidget(0, 5)
         self.obj_table.setHorizontalHeaderLabels(["Handle", "Class", "Label", "ID (hex)", "Key Type"])
@@ -250,6 +255,10 @@ class MainWindow(QMainWindow):
         self.view_attrs_btn.setEnabled(obj_enabled)
         self.class_filter.setEnabled(obj_enabled)
         self.sign_file_btn.setEnabled(obj_enabled)
+        self.delete_object_btn.setEnabled(obj_enabled)
+
+        if obj_enabled:
+            self.on_list_objects()
 
     def _log(self, msg: str):
         self.log.append(msg)
@@ -257,6 +266,38 @@ class MainWindow(QMainWindow):
     def _error(self, msg: str):
         QMessageBox.critical(self, "Error", msg)
         self._log(f"ERROR: {msg}")
+    
+    def on_delete_object(self):
+        if not self.current_session:
+            return
+
+        object_index = self._selected_object_index()
+        if object_index is None:
+            self._error("Select an object row first.")
+            return
+
+        obj = self.listed_objects[object_index]
+        label = obj[Attribute.LABEL]
+        label_str = label.decode(errors="ignore") if isinstance(label, (bytes, bytearray)) else safe_str(label)
+
+        reply = QMessageBox.warning(
+            self,
+            "Confirm Deletion",
+            f"Delete object: {label_str}?\nThis action cannot be undone.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+
+        if reply == QMessageBox.Yes:
+            def delete_obj():
+                obj.destroy()
+
+            self._log(f"Deleting object: {label_str}")
+            w = Worker(delete_obj)
+            w.ok.connect(lambda _: self._log(f"Object deleted.") or self.on_list_objects())
+            w.err.connect(self._error)
+            w.start()
+            self._worker = w
 
     def on_view_attributes(self):
         if not self.current_session:
@@ -274,25 +315,102 @@ class MainWindow(QMainWindow):
         dialog.resize(600, 400)
         layout = QVBoxLayout(dialog)
 
-        table = QTableWidget(0, 2)
-        table.setHorizontalHeaderLabels(["Attribute", "Value"])
+        table = QTableWidget(0, 3)
+        table.setHorizontalHeaderLabels(["Attribute", "Value", "Description"])
         table.setEditTriggers(QTableWidget.NoEditTriggers)
 
-        try:
-            for attr in Attribute:
-                try:
-                    value = obj[attr]
-                    if isinstance(value, (bytes, bytearray)):
-                        value = value.hex()
+        # PKCS#11 attribute descriptions
+        attr_descriptions = {
+            Attribute.CLASS: "Object class (e.g., PUBLIC_KEY, PRIVATE_KEY, SECRET_KEY, CERTIFICATE, DATA)",
+            Attribute.TOKEN: "Whether the object is stored on the token (persistent) or in session memory",
+            Attribute.PRIVATE: "Whether the object is private and requires authentication to access",
+            Attribute.LABEL: "Human-readable label for the object, useful for identification",
+            Attribute.APPLICATION: "Identifies the application that manages the object",
+            Attribute.ID: "Identifier for the object, often used to match public/private key pairs",
+            Attribute.CERTIFICATE_TYPE: "Type of certificate (X.509, X.509 Attr, WTLS)",
+            Attribute.ISSUER: "DER-encoded X.509 issuer name of the certificate",
+            Attribute.SERIAL_NUMBER: "Certificate serial number assigned by the issuer",
+            Attribute.AC_ISSUER: "Issuer of the attribute certificate",
+            Attribute.OWNER: "DER-encoded owner name for attribute certificates",
+            Attribute.ATTR_TYPES: "BER-encoded attribute types for attribute certificates",
+            Attribute.TRUSTED: "Whether the certificate is trusted for its stated purpose",
+            Attribute.JAVA_MIDP_SECURITY_DOMAIN: "Java MIDP security domain identifier",
+            Attribute.URL: "URL value associated with the object",
+            Attribute.HASH_OF_SUBJECT_PUBLIC_KEY: "SHA-1 hash of the subject's public key",
+            Attribute.HASH_OF_ISSUER_PUBLIC_KEY: "SHA-1 hash of the issuer's public key",
+            Attribute.CHECK_VALUE: "Check value (usually first/last bytes) for object verification",
+            Attribute.KEY_TYPE: "Type of cryptographic key (RSA, EC, AES, DES, etc.)",
+            Attribute.SUBJECT: "DER-encoded X.509 subject name",
+            Attribute.SENSITIVE: "Whether the object is sensitive and cannot be read in plaintext",
+            Attribute.ENCRYPT: "Whether the key can be used for encryption operations",
+            Attribute.DECRYPT: "Whether the key can be used for decryption operations",
+            Attribute.SIGN: "Whether the key can be used to create digital signatures",
+            Attribute.VERIFY: "Whether the key can be used to verify digital signatures",
+            Attribute.WRAP: "Whether the key can wrap (encrypt) other keys for transport",
+            Attribute.UNWRAP: "Whether the key can unwrap (decrypt) other keys",
+            Attribute.SIGN_RECOVER: "Whether the key supports signing with message recovery",
+            Attribute.VERIFY_RECOVER: "Whether the key supports verification with message recovery",
+            Attribute.DERIVE: "Whether the key can derive other keys using KDF mechanisms",
+            Attribute.START_DATE: "Start date of object validity (YYYYMMDD format)",
+            Attribute.END_DATE: "End date of object validity (YYYYMMDD format)",
+            Attribute.MODULUS: "Modulus (N) of an RSA public or private key",
+            Attribute.MODULUS_BITS: "Length of RSA modulus in bits",
+            Attribute.PUBLIC_EXPONENT: "Public exponent (E) of an RSA key",
+            Attribute.PRIVATE_EXPONENT: "Private exponent (D) of an RSA private key",
+            Attribute.PRIME_1: "Prime factor P of RSA private key (part of CRT)",
+            Attribute.PRIME_2: "Prime factor Q of RSA private key (part of CRT)",
+            Attribute.EXPONENT_1: "Exponent 1 (D mod P-1) of RSA private key (CRT optimization)",
+            Attribute.EXPONENT_2: "Exponent 2 (D mod Q-1) of RSA private key (CRT optimization)",
+            Attribute.COEFFICIENT: "CRT coefficient (Q^-1 mod P) for RSA private key",
+            Attribute.PRIME: "Prime (P) of a Diffie-Hellman key pair",
+            Attribute.SUBPRIME: "Subprime (Q) of a Diffie-Hellman key pair",
+            Attribute.BASE: "Base (G) of a Diffie-Hellman key pair",
+            Attribute.PRIME_BITS: "Length of DH prime in bits",
+            Attribute.SUBPRIME_BITS: "Length of DH subprime in bits",
+            Attribute.VALUE_BITS: "Length of secret key value in bits",
+            Attribute.VALUE_LEN: "Length of key value in bytes",
+            Attribute.EXTRACTABLE: "Whether the key material can be extracted from the token",
+            Attribute.LOCAL: "Whether the key was generated locally on the token",
+            Attribute.NEVER_EXTRACTABLE: "Whether the key can never be extracted (enforced by token)",
+            Attribute.ALWAYS_SENSITIVE: "Whether the key has always been marked as sensitive",
+            Attribute.KEY_GEN_MECHANISM: "Mechanism type used to generate the key",
+            Attribute.MODIFIABLE: "Whether the object attributes can be modified",
+            Attribute.EC_PARAMS: "DER-encoded elliptic curve parameters (OID or explicit params)",
+            Attribute.EC_POINT: "Elliptic curve point (public key) as octet string",
+            Attribute.SECONDARY_AUTH: "Secondary authentication required for key use",
+            Attribute.AUTH_PIN_FLAGS: "Authentication PIN flags for access control",
+            Attribute.ALWAYS_AUTHENTICATE: "Whether user authentication is required before each use",
+            Attribute.WRAP_WITH_TRUSTED: "Whether key wrapping must use a trusted key",
+            Attribute.OTP_FORMAT: "Format of one-time password (DECIMAL, HEXADECIMAL, ALPHANUMERIC)",
+            Attribute.OTP_LENGTH: "Length of generated one-time password",
+            Attribute.OTP_TIME_INTERVAL: "Time interval in seconds for time-based OTP",
+            Attribute.OTP_USER_FRIENDLY_MODE: "User-friendly mode for OTP (easier to read format)",
+            Attribute.OTP_COUNTER: "Counter value for counter-based OTP",
+            Attribute.GOSTR3410_PARAMS: "GOST R 34.10 elliptic curve parameters",
+            Attribute.GOSTR3411_PARAMS: "GOST R 34.11 hash algorithm parameters",
+            Attribute.GOST28147_PARAMS: "GOST 28147 symmetric cipher parameters",
+            Attribute.HW_FEATURE_TYPE: "Type of hardware feature (CLOCK, MONOTONIC_COUNTER, etc.)",
+            Attribute.RESET_ON_INIT: "Whether hardware feature resets on initialization",
+            Attribute.HAS_RESET: "Whether the hardware feature has been reset",
+        }
+        for attr in Attribute:
+            try:
+                value = obj[attr]
+            except AttributeTypeInvalid:
+                continue
+            except AttributeSensitive:
+                value = "<sensitive>"
+            except NotImplementedError:
+                value = "<retrieval not implemented>"
+            if isinstance(value, (bytes, bytearray)):
+                value = value.hex()
 
-                    row = table.rowCount()
-                    table.insertRow(row)
-                    table.setItem(row, 0, QTableWidgetItem(attr.name))
-                    table.setItem(row, 1, QTableWidgetItem(str(value)))
-                except Exception:
-                    pass
-        except Exception as e:
-            self._error(f"Error reading attributes: {e}")
+            row = table.rowCount()
+            table.insertRow(row)
+            table.setItem(row, 0, QTableWidgetItem(attr.name))
+            table.setItem(row, 1, QTableWidgetItem(str(value)))
+            description = attr_descriptions.get(attr, "No description available")
+            table.setItem(row, 2, QTableWidgetItem(description))
 
         layout.addWidget(table)
         dialog.exec()
