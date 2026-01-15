@@ -10,13 +10,12 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QFileDialog, QMessageBox,
     QVBoxLayout, QHBoxLayout, QFormLayout, QLineEdit, QPushButton,
     QLabel, QComboBox, QTableWidget, QTableWidgetItem, QGroupBox,
-    QSplitter, QTextEdit
+    QSplitter, QTextEdit, QDialog, QSpinBox
 )
 
 # PKCS#11
 from pkcs11 import lib as pkcs11_lib
 from pkcs11 import Mechanism, Attribute, ObjectClass, KeyType
-
 
 @dataclass
 class SlotInfo:
@@ -32,6 +31,49 @@ def safe_str(x) -> str:
         return str(x).strip()
     except Exception:
         return "<unprintable>"
+
+
+class CreateObjectDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Create Object")
+        self.setModal(True)
+
+        layout = QFormLayout(self)
+
+        self.key_type_combo = QComboBox()
+        self.key_type_combo.addItem("AES", KeyType.AES)
+        self.key_type_combo.addItem("EC", KeyType.EC)
+
+        self.key_size_spin = QSpinBox()
+        self.key_size_spin.setMinimum(128)
+        self.key_size_spin.setMaximum(4096)
+        self.key_size_spin.setValue(256)
+        self.key_size_spin.setSingleStep(8)
+
+        self.label_edit = QLineEdit()
+        self.label_edit.setPlaceholderText("(optional)")
+
+        layout.addRow("Key Type:", self.key_type_combo)
+        layout.addRow("Key Size (bits):", self.key_size_spin)
+        layout.addRow("Label:", self.label_edit)
+
+        buttons = QHBoxLayout()
+        ok_btn = QPushButton("OK")
+        cancel_btn = QPushButton("Cancel")
+        ok_btn.clicked.connect(self.accept)
+        cancel_btn.clicked.connect(self.reject)
+        buttons.addWidget(ok_btn)
+        buttons.addWidget(cancel_btn)
+
+        layout.addRow(buttons)
+
+    def get_values(self):
+        return (
+            self.key_type_combo.currentData(),
+            self.key_size_spin.value(),
+            self.label_edit.text()
+        )
 
 
 class Worker(QThread):
@@ -140,6 +182,12 @@ class MainWindow(QMainWindow):
         self.list_objects_btn = QPushButton("List objects")
         self.list_objects_btn.clicked.connect(self.on_list_objects)
 
+        self.create_object_btn = QPushButton("Create object")
+        self.create_object_btn.clicked.connect(self.on_create_object)
+
+        self.view_attrs_btn = QPushButton("View attributes")
+        self.view_attrs_btn.clicked.connect(self.on_view_attributes)
+
         self.class_filter = QComboBox()
         self.class_filter.addItem("All", None)
         self.class_filter.addItem("Public Key", ObjectClass.PUBLIC_KEY)
@@ -152,6 +200,8 @@ class MainWindow(QMainWindow):
         obj_toolbar.addWidget(self.class_filter)
         obj_toolbar.addStretch(1)
         obj_toolbar.addWidget(self.list_objects_btn)
+        obj_toolbar.addWidget(self.create_object_btn)
+        obj_toolbar.addWidget(self.view_attrs_btn)
 
         self.obj_table = QTableWidget(0, 5)
         self.obj_table.setHorizontalHeaderLabels(["Handle", "Class", "Label", "ID (hex)", "Key Type"])
@@ -196,6 +246,8 @@ class MainWindow(QMainWindow):
 
         obj_enabled = self.current_session is not None
         self.list_objects_btn.setEnabled(obj_enabled)
+        self.create_object_btn.setEnabled(obj_enabled)
+        self.view_attrs_btn.setEnabled(obj_enabled)
         self.class_filter.setEnabled(obj_enabled)
         self.sign_file_btn.setEnabled(obj_enabled)
 
@@ -205,6 +257,81 @@ class MainWindow(QMainWindow):
     def _error(self, msg: str):
         QMessageBox.critical(self, "Error", msg)
         self._log(f"ERROR: {msg}")
+
+    def on_view_attributes(self):
+        if not self.current_session:
+            return
+
+        object_index = self._selected_object_index()
+        if object_index is None:
+            self._error("Select an object row first.")
+            return
+
+        obj = self.listed_objects[object_index]
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Object Attributes")
+        dialog.resize(600, 400)
+        layout = QVBoxLayout(dialog)
+
+        table = QTableWidget(0, 2)
+        table.setHorizontalHeaderLabels(["Attribute", "Value"])
+        table.setEditTriggers(QTableWidget.NoEditTriggers)
+
+        try:
+            for attr in Attribute:
+                try:
+                    value = obj[attr]
+                    if isinstance(value, (bytes, bytearray)):
+                        value = value.hex()
+
+                    row = table.rowCount()
+                    table.insertRow(row)
+                    table.setItem(row, 0, QTableWidgetItem(attr.name))
+                    table.setItem(row, 1, QTableWidgetItem(str(value)))
+                except Exception:
+                    pass
+        except Exception as e:
+            self._error(f"Error reading attributes: {e}")
+
+        layout.addWidget(table)
+        dialog.exec()
+
+    def on_create_object(self):
+        if not self.current_session:
+            return
+
+        dialog = CreateObjectDialog(self)
+        if dialog.exec():
+            key_type, key_size, label = dialog.get_values()
+
+            def create_obj():
+                template = {
+                    Attribute.CLASS: ObjectClass.SECRET_KEY,
+                    Attribute.KEY_TYPE: key_type,
+                    Attribute.TOKEN: True,
+                    Attribute.PRIVATE: True,
+                    Attribute.SENSITIVE: True,
+                    Attribute.DECRYPT: True,
+                    Attribute.ENCRYPT: True,
+                    Attribute.SIGN: True,
+                    Attribute.VERIFY: True,
+                    Attribute.WRAP: True,
+                    Attribute.UNWRAP: True,
+                }
+                if label:
+                    template[Attribute.LABEL] = label.encode()
+
+                mech = Mechanism.AES_KEY_GEN if key_type == KeyType.AES else Mechanism.EC_KEY_PAIR_GEN
+                obj = self.current_session.generate_secret_key(mech, template)
+                return obj.handle
+
+            self._log(f"Creating object: {label}")
+            w = Worker(create_obj)
+            w.ok.connect(lambda h: self._log(f"Object created with handle: {h}") or self.on_list_objects())
+            w.err.connect(self._error)
+            w.start()
+            self._worker = w
 
     # ---------------- Actions ----------------
     def on_browse_module(self):
@@ -393,7 +520,7 @@ class MainWindow(QMainWindow):
             return int(self.obj_table.item(row, 3).text(), 16)
         except Exception:
             return None
-    
+
     def _selected_object_index(self) -> Optional[int]:
         sel = self.obj_table.selectionModel().selectedRows()
         if not sel:
@@ -419,7 +546,7 @@ class MainWindow(QMainWindow):
         def do_sign():
             with open(in_path, "rb") as f:
                 data = f.read()
-            
+
             # Many tokens expect "raw" data for the combined SHA256_RSA_PKCS / ECDSA_SHA256 mechanisms,
             # and they hash internally. Some tokens expect you to hash first depending on mechanism.
             # This example uses the "hashing" mechanisms in pkcs11 where supported.
