@@ -16,6 +16,8 @@ yhsm_wrapper() {
     yubihsm-shell --connector yhusb:// -p password "$@"
 }
 
+trap 'echo "An error occurred. YubiHSM verification failed. Exiting."' ERR
+
 # Retrieve the device certificate stored in the YubiHSM
 cert=$(yhsm_wrapper -a get-opaque --outformat PEM)
 
@@ -95,6 +97,12 @@ else
     exit 1
 fi
 
+# Only generate the attestation-verification key if it does not already exist
+attestation_verification_object=$(yhsm_wrapper -a list-objects -A any -l attestation-verification | grep attestation-verification || true)
+if test -z "$attestation_verification_object"; then
+    yhsm_wrapper -a generate-asymmetric-key -i 1 -l attestation-verification -A ed25519 -c sign-eddsa
+fi
+
 # Verifiy that the ed25519 attestation certificate is signed by the device certificate
 attestation_certificate=$(yhsm_wrapper -a sign-attestation-certificate -i 1 --attestation-id 0 --outformat PEM)
 openssl verify -CAfile <(echo "${cert}"$'\n'"${fullchain}") /dev/stdin <<< "$attestation_certificate" || {
@@ -102,13 +110,6 @@ openssl verify -CAfile <(echo "${cert}"$'\n'"${fullchain}") /dev/stdin <<< "$att
     exit 1
 }
 echo "Attestation certificate verified successfully."
-
-
-# Only generate the attestation-verification key if it does not already exist
-attestation_verification_object=$(yhsm_wrapper -a list-objects -A any -l attestation-verification)
-if test -z "$attestation_verification_object"; then
-    yhsm_wrapper -a generate-asymmetric-key -i 1 -l attestation-verification -A ed25519 -c sign-eddsa
-fi
 
 # Extract public key from attestation certificate for usage in signature verification
 attestation_pubkey=$(openssl x509 -in <(echo "$attestation_certificate") -pubkey -noout)

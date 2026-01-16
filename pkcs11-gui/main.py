@@ -109,6 +109,11 @@ class MainWindow(QMainWindow):
         self.listed_objects: List[Object] = []
 
         self._build_ui()
+
+        if os.getenv('PKCS11_MODULE_PROVIDER'):
+            self.module_path_edit.setText(os.getenv('PKCS11_MODULE_PROVIDER'))
+            self.on_load_module()
+
         self._set_connected(False)
 
     # ---------------- UI ----------------
